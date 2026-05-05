@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pickleball Stacker</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <span class="app-logo">🏓</span>
+      <span class="app-title">Pickleball Stacker</span>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-outline" onclick="showShareModal()">🔗 Share</button>
+      <button class="btn btn-ghost" onclick="confirmNewSession()">New Session</button>
+    </div>
+  </header>
+
+  <!-- Tab Navigation -->
+  <nav class="tab-nav">
+    <button class="tab-btn" data-tab="players" onclick="switchTab('players')">
+      Players <span class="tab-badge" id="badge-players">0</span>
+    </button>
+    <button class="tab-btn" data-tab="courts" onclick="switchTab('courts')">Courts</button>
+    <button class="tab-btn active" data-tab="play" onclick="switchTab('play')">
+      Live Play <span class="tab-badge active" id="badge-playing">0</span>
+    </button>
+  </nav>
+
+  <!-- Main Content -->
+  <main class="main-content">
+
+    <!-- ── Players Tab ── -->
+    <div id="tab-players" class="tab-panel">
+      <div class="panel-header">
+        <div>
+          <h2>Players</h2>
+          <div class="player-stats" id="player-stats"></div>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-secondary" onclick="showBulkModal()">+ Bulk Add</button>
+          <button class="btn btn-primary" onclick="showAddPlayerModal()">+ Add Player</button>
+        </div>
+      </div>
+      <div id="players-list" class="players-list"></div>
+      <div id="players-empty" class="empty-state">
+        <div class="empty-icon">👥</div>
+        <p>No players yet.</p>
+        <p class="empty-hint">Add players to get started!</p>
+      </div>
+    </div>
+
+    <!-- ── Courts Tab ── -->
+    <div id="tab-courts" class="tab-panel">
+      <div class="panel-header">
+        <h2>Courts</h2>
+        <div class="counter-control">
+          <button class="counter-btn" onclick="removeCourt()">−</button>
+          <span id="court-count-display">4</span>
+          <span class="counter-label">courts</span>
+          <button class="counter-btn" onclick="addCourt()">+</button>
+        </div>
+      </div>
+      <div id="courts-config" class="courts-config-list"></div>
+
+      <div class="settings-card">
+        <h3>Pairing Mode</h3>
+        <p class="setting-hint">How players are selected when a court opens up</p>
+        <div class="btn-group" id="pairing-mode-group">
+          <button class="btn btn-sm mode-btn active" data-mode="random" onclick="setPairingMode('random')">🎲 Random</button>
+          <button class="btn btn-sm mode-btn" data-mode="skill" onclick="setPairingMode('skill')">⭐ By Skill</button>
+          <button class="btn btn-sm mode-btn" data-mode="category" onclick="setPairingMode('category')">🏷️ By Category</button>
+        </div>
+
+        <h3 style="margin-top:1.5rem">Game Format</h3>
+        <p class="setting-hint">What happens when a game ends</p>
+        <div class="btn-group" id="format-group">
+          <button class="btn btn-sm format-btn active" data-format="rotation" onclick="setGameFormat('rotation')">🔄 Full Rotation</button>
+          <button class="btn btn-sm format-btn" data-format="winners" onclick="setGameFormat('winners')">👑 Winners Stay</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Live Play Tab ── -->
+    <div id="tab-play" class="tab-panel active">
+      <div class="live-layout">
+
+        <!-- Courts Column -->
+        <div class="live-courts-col">
+          <div class="live-col-header">
+            <h2>Courts</h2>
+            <div class="pairing-pills" id="pairing-pills">
+              <button class="pill active" data-mode="random" onclick="setPairingMode('random')">🎲 Random</button>
+              <button class="pill" data-mode="skill" onclick="setPairingMode('skill')">⭐ Skill</button>
+              <button class="pill" data-mode="category" onclick="setPairingMode('category')">🏷️ Category</button>
+            </div>
+          </div>
+          <div id="courts-grid" class="courts-grid"></div>
+        </div>
+
+        <!-- Queue Column -->
+        <div class="live-queue-col">
+          <div class="live-col-header">
+            <h2>Queue</h2>
+            <span class="queue-badge" id="queue-count">0 waiting</span>
+          </div>
+          <div id="queue-list" class="queue-list"></div>
+          <div id="queue-empty" class="empty-state small" style="display:none">
+            <p>No players in queue</p>
+          </div>
+
+          <div class="sitting-section" id="sitting-section" style="display:none">
+            <h3>Sitting Out</h3>
+            <div id="sitting-list" class="sitting-list"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ══════════ MODALS ══════════ -->
+
+<!-- Add / Edit Player -->
+<div id="modal-player" class="modal-overlay" onclick="closeModal('modal-player')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3 id="modal-player-title">Add Player</h3>
+      <button class="modal-close" onclick="closeModal('modal-player')">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="edit-player-id">
+      <div class="form-group">
+        <label>Name</label>
+        <input type="text" id="player-name-input" class="form-input" placeholder="Player name"
+               onkeydown="if(event.key==='Enter') savePlayer()">
+      </div>
+      <div class="form-group">
+        <label>Skill Level</label>
+        <div class="star-input" id="skill-stars" data-target="skill-value"></div>
+        <input type="hidden" id="skill-value" value="3">
+        <div class="skill-labels">
+          <span>1 – Beginner</span><span>3 – Intermediate</span><span>5 – Advanced</span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Category</label>
+        <select id="category-select" class="form-select"></select>
+      </div>
+      <div class="form-group">
+        <label>Status</label>
+        <select id="status-select" class="form-select">
+          <option value="queue">In Queue</option>
+          <option value="sitting">Sitting Out</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-player')">Cancel</button>
+      <button class="btn btn-primary" onclick="savePlayer()">Save Player</button>
+    </div>
+  </div>
+</div>
+
+<!-- Bulk Add -->
+<div id="modal-bulk" class="modal-overlay" onclick="closeModal('modal-bulk')">
+  <div class="modal modal-wide" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3>Bulk Add Players</h3>
+      <button class="modal-close" onclick="closeModal('modal-bulk')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="helper-text">One player per line. Optionally add skill (1–5) and category, comma-separated.</p>
+      <div class="bulk-example">
+        <strong>Examples:</strong><br>
+        John Smith<br>
+        Jane Doe, 4, Women's<br>
+        Bob Jones, 3, Men's
+      </div>
+      <textarea id="bulk-text" class="form-textarea" rows="10"
+                placeholder="John Smith&#10;Jane Doe, 4, Women's&#10;Bob Jones, 3, Men's"></textarea>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Default Skill</label>
+          <div class="star-input" id="bulk-skill-stars" data-target="bulk-skill-value"></div>
+          <input type="hidden" id="bulk-skill-value" value="3">
+        </div>
+        <div class="form-group">
+          <label>Default Category</label>
+          <select id="bulk-category" class="form-select"></select>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('modal-bulk')">Cancel</button>
+      <button class="btn btn-primary" onclick="bulkAddPlayers()">Add Players</button>
+    </div>
+  </div>
+</div>
+
+<!-- Share Session -->
+<div id="modal-share" class="modal-overlay" onclick="closeModal('modal-share')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3>Share Session</h3>
+      <button class="modal-close" onclick="closeModal('modal-share')">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="helper-text">Send this link to transfer the session to another host. They'll see the current players, courts, and queue.</p>
+      <div class="share-url-row">
+        <input type="text" id="share-url-input" class="form-input" readonly>
+        <button class="btn btn-primary" onclick="copyShareUrl()">Copy</button>
+      </div>
+      <p id="share-feedback" class="share-feedback"></p>
+    </div>
+  </div>
+</div>
+
+<!-- End Game -->
+<div id="modal-end-game" class="modal-overlay" onclick="closeModal('modal-end-game')">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h3 id="end-game-title">End Game</h3>
+      <button class="modal-close" onclick="closeModal('modal-end-game')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="end-game-teams">
+        <div class="end-team" id="end-team1-display"></div>
+        <div class="vs-badge">VS</div>
+        <div class="end-team" id="end-team2-display"></div>
+      </div>
+      <p class="helper-text" style="margin-top:1rem;text-align:center">Who won, or rotate all out?</p>
+    </div>
+    <div class="modal-footer end-footer">
+      <button class="btn btn-outline" onclick="resolveGame(null)">🔄 All Rotate</button>
+      <button class="btn btn-success" onclick="resolveGame('team1')">🏆 Team 1 Wins</button>
+      <button class="btn btn-success" onclick="resolveGame('team2')">🏆 Team 2 Wins</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

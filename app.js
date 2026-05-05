@@ -1,0 +1,870 @@
+/* ============================================================
+   PICKLEBALL STACKER — App Logic
+   ============================================================ */
+
+// ── Constants ──────────────────────────────────────────────
+
+const CATEGORIES = ['Any', "Men's", "Women's", 'Mixed', 'Beginner', 'Intermediate', 'Advanced'];
+const CAT_CLASSES = {
+  "Any": "any", "Men's": "mens", "Women's": "womens",
+  "Mixed": "mixed", "Beginner": "beginner",
+  "Intermediate": "intermediate", "Advanced": "advanced"
+};
+
+// ── State ──────────────────────────────────────────────────
+
+let state = {
+  players: [],   // { id, name, skill (1-5), category, status: 'queue'|'playing'|'sitting' }
+  courts:  [],   // { id, name, exclusiveCategory: null|string }
+  queue:   [],   // [playerId, ...] ordered
+  games:   {},   // { courtId: { team1:[id,id], team2:[id,id], startTime:ms } }
+  settings: {
+    pairingMode: 'random',    // 'random' | 'skill' | 'category'
+    gameFormat:  'rotation',  // 'rotation' | 'winners'
+  }
+};
+
+let currentTab      = 'play';
+let timerInterval   = null;
+let pendingCourtId  = null;  // for end-game modal
+
+// ── Utilities ──────────────────────────────────────────────
+
+function genId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function formatTime(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function getPlayer(id) { return state.players.find(p => p.id === id); }
+
+function saveState() {
+  try { localStorage.setItem('pb_stacker_v1', JSON.stringify(state)); } catch (_) {}
+}
+
+function encodeState(s) {
+  try { return btoa(unescape(encodeURIComponent(JSON.stringify(s)))); } catch (_) { return ''; }
+}
+
+function decodeState(str) {
+  try { return JSON.parse(decodeURIComponent(escape(atob(str)))); } catch (_) { return null; }
+}
+
+function showToast(msg, duration = 2500) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ── Persistence ────────────────────────────────────────────
+
+function loadFromStorage() {
+  try {
+    const raw = localStorage.getItem('pb_stacker_v1');
+    if (raw) { state = JSON.parse(raw); return true; }
+  } catch (_) {}
+  return false;
+}
+
+function loadFromHash() {
+  const hash = window.location.hash;
+  if (!hash.startsWith('#state=')) return false;
+  const decoded = decodeState(hash.slice(7));
+  if (!decoded) return false;
+  state = decoded;
+  // Clear hash without reload
+  history.replaceState(null, '', window.location.pathname);
+  showToast('✅ Session loaded from shared link');
+  return true;
+}
+
+// ── Category Helpers ───────────────────────────────────────
+
+function populateCategorySelects() {
+  const selects = [
+    document.getElementById('category-select'),
+    document.getElementById('bulk-category'),
+  ];
+  selects.forEach(sel => {
+    if (!sel) return;
+    sel.innerHTML = CATEGORIES.map(c => `<option>${c}</option>`).join('');
+  });
+}
+
+function catClass(cat) { return CAT_CLASSES[cat] || 'any'; }
+
+function catTag(cat) {
+  return `<span class="cat-tag ${catClass(cat)}">${cat}</span>`;
+}
+
+function starsHtml(skill, small = false) {
+  let html = `<span class="stars">`;
+  for (let i = 1; i <= 5; i++) {
+    html += `<span class="${i <= skill ? 's-on' : 's-off'}">★</span>`;
+  }
+  return html + '</span>';
+}
+
+// ── Star Inputs ────────────────────────────────────────────
+
+function buildStarInput(containerId, targetId) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = '';
+  for (let i = 1; i <= 5; i++) {
+    const s = document.createElement('span');
+    s.className = 'star';
+    s.textContent = '★';
+    s.dataset.val = i;
+    s.addEventListener('click', () => setStarValue(containerId, targetId, i));
+    s.addEventListener('mouseenter', () => highlightStars(containerId, i));
+    s.addEventListener('mouseleave', () => {
+      const cur = parseInt(document.getElementById(targetId).value) || 3;
+      highlightStars(containerId, cur);
+    });
+    el.appendChild(s);
+  }
+  const cur = parseInt(document.getElementById(targetId).value) || 3;
+  highlightStars(containerId, cur);
+}
+
+function setStarValue(containerId, targetId, val) {
+  document.getElementById(targetId).value = val;
+  highlightStars(containerId, val);
+}
+
+function highlightStars(containerId, val) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.querySelectorAll('.star').forEach((s, i) => {
+    s.classList.toggle('on', i < val);
+  });
+}
+
+// ── Players ────────────────────────────────────────────────
+
+function addPlayer(name, skill, category, status = 'queue') {
+  const p = { id: genId(), name: name.trim(), skill: clampSkill(skill), category, status };
+  state.players.push(p);
+  if (status === 'queue') state.queue.push(p.id);
+  saveState();
+  return p;
+}
+
+function clampSkill(v) { return Math.max(1, Math.min(5, parseInt(v) || 3)); }
+
+function removePlayerById(id) {
+  // Remove from any active game (just clean up; don't end game automatically)
+  for (const cid in state.games) {
+    const g = state.games[cid];
+    g.team1 = g.team1.filter(x => x !== id);
+    g.team2 = g.team2.filter(x => x !== id);
+    if (g.team1.length === 0 && g.team2.length === 0) delete state.games[cid];
+  }
+  state.queue = state.queue.filter(x => x !== id);
+  state.players = state.players.filter(p => p.id !== id);
+  saveState();
+  render();
+}
+
+function updatePlayerData(id, data) {
+  const idx = state.players.findIndex(p => p.id === id);
+  if (idx < 0) return;
+  const prev = state.players[idx];
+  state.players[idx] = { ...prev, ...data };
+  // Sync queue membership if status changed
+  if (data.status !== undefined && data.status !== prev.status) {
+    state.queue = state.queue.filter(x => x !== id);
+    if (data.status === 'queue') state.queue.push(id);
+  }
+  saveState();
+  render();
+}
+
+function toggleSitOut(id) {
+  const p = getPlayer(id);
+  if (!p || p.status === 'playing') return;
+  if (p.status === 'sitting') {
+    p.status = 'queue';
+    state.queue.push(id);
+  } else {
+    p.status = 'sitting';
+    state.queue = state.queue.filter(x => x !== id);
+  }
+  saveState();
+  render();
+}
+
+function moveInQueue(id, dir) {
+  const idx = state.queue.indexOf(id);
+  if (idx < 0) return;
+  const nidx = idx + dir;
+  if (nidx < 0 || nidx >= state.queue.length) return;
+  [state.queue[idx], state.queue[nidx]] = [state.queue[nidx], state.queue[idx]];
+  saveState();
+  renderLiveTab();
+}
+
+// ── Courts ─────────────────────────────────────────────────
+
+function initDefaultCourts(n = 4) {
+  state.courts = [];
+  for (let i = 1; i <= n; i++) {
+    state.courts.push({ id: genId(), name: `Court ${i}`, exclusiveCategory: null });
+  }
+  saveState();
+}
+
+function addCourt() {
+  state.courts.push({ id: genId(), name: `Court ${state.courts.length + 1}`, exclusiveCategory: null });
+  saveState();
+  render();
+}
+
+function removeCourt() {
+  if (state.courts.length <= 1) { showToast('Need at least one court'); return; }
+  const last = state.courts[state.courts.length - 1];
+  if (state.games[last.id]) {
+    showToast('End the game on that court first');
+    return;
+  }
+  state.courts.pop();
+  saveState();
+  render();
+}
+
+function updateCourt(id, data) {
+  const c = state.courts.find(c => c.id === id);
+  if (!c) return;
+  Object.assign(c, data);
+  saveState();
+}
+
+// ── Pairing Algorithms ─────────────────────────────────────
+
+function queuedPlayers() {
+  return state.queue.map(id => getPlayer(id)).filter(Boolean);
+}
+
+function filterForCourt(players, court) {
+  if (!court.exclusiveCategory || court.exclusiveCategory === 'Any') return players;
+  return players.filter(p => p.category === court.exclusiveCategory || p.category === 'Any');
+}
+
+function pickPlayers(court) {
+  const pool = filterForCourt(queuedPlayers(), court);
+  if (pool.length < 4) return null;
+
+  switch (state.settings.pairingMode) {
+    case 'skill':    return pickBySkill(pool);
+    case 'category': return pickByCategory(pool, court);
+    default:         return pool.slice(0, 4); // FIFO for random/fair rotation
+  }
+}
+
+function pickBySkill(pool) {
+  // Sort by skill desc, take top 4
+  return [...pool].sort((a, b) => b.skill - a.skill).slice(0, 4);
+}
+
+function pickByCategory(pool, court) {
+  if (court.exclusiveCategory) return pool.slice(0, 4);
+  // Try to find 4 from the same category (respecting queue order)
+  const cats = [...new Set(pool.map(p => p.category))];
+  for (const cat of cats) {
+    if (cat === 'Any') continue;
+    const grp = pool.filter(p => p.category === cat || p.category === 'Any');
+    if (grp.length >= 4) return grp.slice(0, 4);
+  }
+  return pool.slice(0, 4);
+}
+
+function makeTeams(players) {
+  if (state.settings.pairingMode === 'skill') {
+    // Balance: 1st+4th vs 2nd+3rd (by skill rank)
+    const s = [...players].sort((a, b) => b.skill - a.skill);
+    return { team1: [s[0], s[3]], team2: [s[1], s[2]] };
+  }
+  const s = shuffle(players);
+  return { team1: [s[0], s[1]], team2: [s[2], s[3]] };
+}
+
+// ── Games ──────────────────────────────────────────────────
+
+function startGame(courtId) {
+  const court = state.courts.find(c => c.id === courtId);
+  if (!court || state.games[courtId]) return;
+
+  const picked = pickPlayers(court);
+  if (!picked) {
+    const needed = court.exclusiveCategory ? `${court.exclusiveCategory} players` : 'players';
+    showToast(`Not enough ${needed} in queue (need 4)`);
+    return;
+  }
+
+  const { team1, team2 } = makeTeams(picked);
+  const allPicked = [...team1, ...team2];
+
+  allPicked.forEach(p => {
+    p.status = 'playing';
+    state.queue = state.queue.filter(id => id !== p.id);
+  });
+
+  state.games[courtId] = {
+    team1: team1.map(p => p.id),
+    team2: team2.map(p => p.id),
+    startTime: Date.now()
+  };
+
+  saveState();
+  render();
+}
+
+function endGame(courtId, winner) {
+  // winner: null = rotation, 'team1', 'team2'
+  const game = state.games[courtId];
+  if (!game) return;
+
+  const { team1, team2 } = game;
+  const isWinnersStay = winner !== null && state.settings.gameFormat === 'winners';
+
+  if (isWinnersStay) {
+    const winners = winner === 'team1' ? team1 : team2;
+    const losers  = winner === 'team1' ? team2 : team1;
+
+    // Losers go to back of queue
+    losers.forEach(id => {
+      const p = getPlayer(id);
+      if (p) { p.status = 'queue'; state.queue.push(id); }
+    });
+
+    // Winners go to front of queue so they're selected first for the next game
+    winners.reverse().forEach(id => {
+      const p = getPlayer(id);
+      if (p) { p.status = 'queue'; state.queue.unshift(id); }
+    });
+  } else {
+    // Full rotation — everyone to back of queue
+    [...team1, ...team2].forEach(id => {
+      const p = getPlayer(id);
+      if (p) { p.status = 'queue'; state.queue.push(id); }
+    });
+  }
+
+  delete state.games[courtId];
+  closeModal('modal-end-game');
+  pendingCourtId = null;
+  saveState();
+  render();
+}
+
+// ── Settings ───────────────────────────────────────────────
+
+function setPairingMode(mode) {
+  state.settings.pairingMode = mode;
+  saveState();
+  // Sync both Courts tab and Live Play tab pill/button states
+  document.querySelectorAll('.mode-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === mode));
+  document.querySelectorAll('.pill').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === mode));
+}
+
+function setGameFormat(fmt) {
+  state.settings.gameFormat = fmt;
+  saveState();
+  document.querySelectorAll('.format-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.format === fmt));
+}
+
+// ── Tab Switching ──────────────────────────────────────────
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-panel').forEach(p =>
+    p.classList.toggle('active', p.id === `tab-${tab}`));
+  render();
+}
+
+// ── Render ─────────────────────────────────────────────────
+
+function render() {
+  renderPlayersTab();
+  renderCourtsTab();
+  if (currentTab === 'play') renderLiveTab();
+  else renderLiveTab(); // keep queue badges updated always
+  updateBadges();
+}
+
+function updateBadges() {
+  const total   = state.players.length;
+  const playing = state.players.filter(p => p.status === 'playing').length;
+
+  document.getElementById('badge-players').textContent = total;
+  const pb = document.getElementById('badge-playing');
+  pb.textContent = playing;
+  pb.classList.toggle('active', playing > 0);
+
+  document.getElementById('court-count-display').textContent = state.courts.length;
+}
+
+// ── Players Tab ────────────────────────────────────────────
+
+function renderPlayersTab() {
+  const list  = document.getElementById('players-list');
+  const empty = document.getElementById('players-empty');
+  const stats = document.getElementById('player-stats');
+
+  const total   = state.players.length;
+  const inQueue = state.players.filter(p => p.status === 'queue').length;
+  const playing = state.players.filter(p => p.status === 'playing').length;
+  const sitting = state.players.filter(p => p.status === 'sitting').length;
+
+  if (total === 0) {
+    list.innerHTML = '';
+    empty.style.display = '';
+    stats.textContent = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+  stats.textContent = `${total} total · ${inQueue} in queue · ${playing} playing · ${sitting} sitting out`;
+
+  list.innerHTML = state.players.map((p, i) => `
+    <div class="player-card ${p.status}">
+      <span class="player-num">${i + 1}</span>
+      <span class="player-name">${esc(p.name)}</span>
+      <div class="player-meta">
+        ${starsHtml(p.skill)}
+        ${catTag(p.category)}
+        <span class="status-badge ${p.status}">${statusLabel(p.status)}</span>
+      </div>
+      <div class="player-actions">
+        <button class="btn btn-icon btn-secondary" title="Edit" onclick="showEditPlayerModal('${p.id}')">✎</button>
+        <button class="btn btn-icon btn-danger" title="Remove" onclick="confirmRemovePlayer('${p.id}')">✕</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function statusLabel(s) {
+  return s === 'queue' ? 'In Queue' : s === 'playing' ? 'Playing' : 'Sitting';
+}
+
+// ── Courts Tab ─────────────────────────────────────────────
+
+function renderCourtsTab() {
+  const cfg = document.getElementById('courts-config');
+
+  cfg.innerHTML = state.courts.map((c, i) => {
+    const hasGame = !!state.games[c.id];
+    const excOpts = CATEGORIES.map(cat =>
+      `<option value="${cat}" ${c.exclusiveCategory === cat ? 'selected' : ''}>${cat}</option>`
+    ).join('');
+
+    return `
+    <div class="court-config-card">
+      <div class="court-config-name">Court ${i + 1}</div>
+      <div class="court-config-row">
+        <input class="form-input-sm" type="text" placeholder="Court name"
+               value="${esc(c.name)}"
+               onchange="updateCourt('${c.id}', {name: this.value}); render()">
+        <label class="court-exclusive-toggle">
+          <input type="checkbox"
+                 ${c.exclusiveCategory ? 'checked' : ''}
+                 onchange="toggleCourtExclusive('${c.id}', this.checked)">
+          Exclusive for:
+        </label>
+        <select class="form-input-sm"
+                ${!c.exclusiveCategory ? 'disabled' : ''}
+                onchange="updateCourt('${c.id}', {exclusiveCategory: this.value}); render()"
+                id="exc-select-${c.id}">
+          ${CATEGORIES.filter(ca => ca !== 'Any').map(cat =>
+            `<option value="${cat}" ${c.exclusiveCategory === cat ? 'selected' : ''}>${cat}</option>`
+          ).join('')}
+        </select>
+      </div>
+      ${hasGame ? `<span class="status-badge playing">Game Active</span>` : ''}
+    </div>`;
+  }).join('');
+
+  // Sync pairing mode buttons
+  const mode = state.settings.pairingMode;
+  document.querySelectorAll('.mode-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === mode));
+
+  const fmt = state.settings.gameFormat;
+  document.querySelectorAll('.format-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.format === fmt));
+}
+
+function toggleCourtExclusive(id, checked) {
+  const c = state.courts.find(c => c.id === id);
+  if (!c) return;
+  if (checked) {
+    c.exclusiveCategory = "Men's"; // default
+  } else {
+    c.exclusiveCategory = null;
+  }
+  saveState();
+  render();
+}
+
+// ── Live Play Tab ──────────────────────────────────────────
+
+function renderLiveTab() {
+  renderCourtsGrid();
+  renderQueue();
+  syncPairingPills();
+}
+
+function syncPairingPills() {
+  const mode = state.settings.pairingMode;
+  document.querySelectorAll('#pairing-pills .pill').forEach(p =>
+    p.classList.toggle('active', p.dataset.mode === mode));
+}
+
+function renderCourtsGrid() {
+  const grid = document.getElementById('courts-grid');
+  if (!grid) return;
+
+  grid.innerHTML = state.courts.map(court => {
+    const game = state.games[court.id];
+    const isExclusive = !!court.exclusiveCategory;
+
+    if (game) {
+      const t1 = game.team1.map(id => getPlayer(id)).filter(Boolean);
+      const t2 = game.team2.map(id => getPlayer(id)).filter(Boolean);
+      const elapsed = Date.now() - game.startTime;
+
+      return `
+      <div class="court-card active-game ${isExclusive ? 'exclusive' : ''}">
+        <div class="court-card-header">
+          <span class="court-card-name">${esc(court.name)}</span>
+          <span class="court-card-timer" data-court="${court.id}">${formatTime(elapsed)}</span>
+        </div>
+        ${isExclusive ? `<span class="court-exclusive-label">${court.exclusiveCategory} Only</span>` : ''}
+        <div class="court-teams">
+          <div class="team-row">
+            <div class="team-label">Team 1</div>
+            <div class="team-players">
+              ${t1.map(p => `<span class="team-player-name">${esc(p.name)} ${starsHtml(p.skill)}</span>`).join('')}
+            </div>
+          </div>
+          <div class="vs-row">VS</div>
+          <div class="team-row">
+            <div class="team-label">Team 2</div>
+            <div class="team-players">
+              ${t2.map(p => `<span class="team-player-name">${esc(p.name)} ${starsHtml(p.skill)}</span>`).join('')}
+            </div>
+          </div>
+        </div>
+        <div class="court-card-footer">
+          <button class="btn btn-danger btn-sm" onclick="showEndGameModal('${court.id}')">End Game</button>
+        </div>
+      </div>`;
+    } else {
+      const queuedPool = filterForCourt(queuedPlayers(), court);
+      const canStart = queuedPool.length >= 4;
+      return `
+      <div class="court-card ${isExclusive ? 'exclusive' : ''}">
+        <div class="court-card-header">
+          <span class="court-card-name">${esc(court.name)}</span>
+        </div>
+        ${isExclusive ? `<span class="court-exclusive-label">${court.exclusiveCategory} Only</span>` : ''}
+        <div class="court-open">
+          <span class="court-open-icon">🏸</span>
+          <span>Court Open</span>
+          ${!canStart ? `<span style="font-size:.75rem;color:var(--text-dim)">
+            Need ${4 - queuedPool.length} more ${court.exclusiveCategory || ''}
+          </span>` : ''}
+        </div>
+        <div class="court-card-footer">
+          <button class="btn btn-primary btn-sm" onclick="startGame('${court.id}')"
+                  ${!canStart ? 'disabled style="opacity:.4;cursor:not-allowed"' : ''}>
+            ▶ Start Game
+          </button>
+        </div>
+      </div>`;
+    }
+  }).join('');
+}
+
+function renderQueue() {
+  const list  = document.getElementById('queue-list');
+  const empty = document.getElementById('queue-empty');
+  const badge = document.getElementById('queue-count');
+
+  const queued = state.queue.map(id => getPlayer(id)).filter(Boolean);
+  badge.textContent = `${queued.length} waiting`;
+
+  if (queued.length === 0) {
+    list.innerHTML = '';
+    empty.style.display = '';
+  } else {
+    empty.style.display = 'none';
+    list.innerHTML = queued.map((p, i) => `
+      <div class="queue-item">
+        <span class="queue-pos">${i + 1}</span>
+        <span class="queue-name">${esc(p.name)}</span>
+        <span class="queue-stars">${starsHtml(p.skill)}</span>
+        ${catTag(p.category)}
+        <div class="queue-actions">
+          <button class="queue-move-btn" title="Move up" onclick="moveInQueue('${p.id}', -1)">▲</button>
+          <button class="queue-move-btn" title="Move down" onclick="moveInQueue('${p.id}', 1)">▼</button>
+          <button class="queue-sit-btn" onclick="toggleSitOut('${p.id}')" title="Sit out">Sit Out</button>
+        </div>
+      </div>`).join('');
+  }
+
+  // Sitting Out
+  const sitting = state.players.filter(p => p.status === 'sitting');
+  const sittingSection = document.getElementById('sitting-section');
+  const sittingList = document.getElementById('sitting-list');
+  if (sittingSection) {
+    sittingSection.style.display = sitting.length > 0 ? '' : 'none';
+    if (sittingList) {
+      sittingList.innerHTML = sitting.map(p => `
+        <div class="sitting-item">
+          <span class="sitting-name">${esc(p.name)}</span>
+          ${starsHtml(p.skill)}
+          ${catTag(p.category)}
+          <button class="sitting-rejoin" onclick="toggleSitOut('${p.id}')">Re-join</button>
+        </div>`).join('');
+    }
+  }
+}
+
+// ── Timers ─────────────────────────────────────────────────
+
+function startTimerLoop() {
+  if (timerInterval) return;
+  timerInterval = setInterval(() => {
+    document.querySelectorAll('.court-card-timer').forEach(el => {
+      const courtId = el.dataset.court;
+      const game = state.games[courtId];
+      if (game) el.textContent = formatTime(Date.now() - game.startTime);
+    });
+  }, 1000);
+}
+
+// ── Modals ─────────────────────────────────────────────────
+
+function openModal(id) {
+  document.getElementById(id).classList.add('open');
+}
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+}
+
+// ── Add / Edit Player Modal ────────────────────────────────
+
+function showAddPlayerModal() {
+  document.getElementById('modal-player-title').textContent = 'Add Player';
+  document.getElementById('edit-player-id').value = '';
+  document.getElementById('player-name-input').value = '';
+  document.getElementById('skill-value').value = '3';
+  document.getElementById('category-select').value = 'Any';
+  document.getElementById('status-select').value = 'queue';
+  buildStarInput('skill-stars', 'skill-value');
+  openModal('modal-player');
+  setTimeout(() => document.getElementById('player-name-input').focus(), 100);
+}
+
+function showEditPlayerModal(id) {
+  const p = getPlayer(id);
+  if (!p) return;
+  document.getElementById('modal-player-title').textContent = 'Edit Player';
+  document.getElementById('edit-player-id').value = id;
+  document.getElementById('player-name-input').value = p.name;
+  document.getElementById('skill-value').value = p.skill;
+  document.getElementById('category-select').value = p.category;
+  document.getElementById('status-select').value = p.status === 'playing' ? 'queue' : p.status;
+  buildStarInput('skill-stars', 'skill-value');
+  openModal('modal-player');
+  setTimeout(() => document.getElementById('player-name-input').focus(), 100);
+}
+
+function savePlayer() {
+  const name     = document.getElementById('player-name-input').value.trim();
+  const skill    = parseInt(document.getElementById('skill-value').value) || 3;
+  const category = document.getElementById('category-select').value;
+  const status   = document.getElementById('status-select').value;
+  const editId   = document.getElementById('edit-player-id').value;
+
+  if (!name) { showToast('⚠️ Enter a player name'); return; }
+
+  if (editId) {
+    updatePlayerData(editId, { name, skill, category, status });
+    showToast('✅ Player updated');
+  } else {
+    addPlayer(name, skill, category, status);
+    showToast(`✅ ${name} added`);
+  }
+
+  closeModal('modal-player');
+  render();
+}
+
+// ── Bulk Add Modal ─────────────────────────────────────────
+
+function showBulkModal() {
+  document.getElementById('bulk-text').value = '';
+  document.getElementById('bulk-skill-value').value = '3';
+  document.getElementById('bulk-category').value = 'Any';
+  buildStarInput('bulk-skill-stars', 'bulk-skill-value');
+  openModal('modal-bulk');
+  setTimeout(() => document.getElementById('bulk-text').focus(), 100);
+}
+
+function bulkAddPlayers() {
+  const text         = document.getElementById('bulk-text').value;
+  const defaultSkill = parseInt(document.getElementById('bulk-skill-value').value) || 3;
+  const defaultCat   = document.getElementById('bulk-category').value;
+
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) { showToast('⚠️ Enter at least one player'); return; }
+
+  let count = 0;
+  lines.forEach(line => {
+    const parts = line.split(',').map(s => s.trim());
+    const name  = parts[0];
+    if (!name) return;
+    const skill = parts[1] ? clampSkill(parts[1]) : defaultSkill;
+    const cat   = parts[2] && CATEGORIES.includes(parts[2]) ? parts[2] : defaultCat;
+    addPlayer(name, skill, cat);
+    count++;
+  });
+
+  closeModal('modal-bulk');
+  showToast(`✅ Added ${count} player${count !== 1 ? 's' : ''}`);
+  render();
+}
+
+// ── End Game Modal ─────────────────────────────────────────
+
+function showEndGameModal(courtId) {
+  const court = state.courts.find(c => c.id === courtId);
+  const game  = state.games[courtId];
+  if (!court || !game) return;
+
+  pendingCourtId = courtId;
+
+  document.getElementById('end-game-title').textContent = `End Game — ${court.name}`;
+
+  const t1 = game.team1.map(id => getPlayer(id)).filter(Boolean);
+  const t2 = game.team2.map(id => getPlayer(id)).filter(Boolean);
+
+  const teamHtml = (players, label) => `
+    <div class="end-team-label">${label}</div>
+    ${players.map(p => `<div class="end-team-player">${esc(p.name)}</div>`).join('')}`;
+
+  document.getElementById('end-team1-display').innerHTML = teamHtml(t1, 'Team 1');
+  document.getElementById('end-team2-display').innerHTML = teamHtml(t2, 'Team 2');
+
+  openModal('modal-end-game');
+}
+
+function resolveGame(winner) {
+  if (!pendingCourtId) return;
+  endGame(pendingCourtId, winner);
+}
+
+// ── Confirm helpers ────────────────────────────────────────
+
+function confirmRemovePlayer(id) {
+  const p = getPlayer(id);
+  if (!p) return;
+  if (confirm(`Remove "${p.name}" from the session?`)) {
+    removePlayerById(id);
+    showToast(`Removed ${p.name}`);
+  }
+}
+
+function confirmNewSession() {
+  if (!confirm('Start a new session? This will clear all players and games.')) return;
+  state = {
+    players: [], courts: [], queue: [], games: {},
+    settings: { pairingMode: 'random', gameFormat: 'rotation' }
+  };
+  initDefaultCourts(4);
+  saveState();
+  render();
+  showToast('New session started');
+}
+
+// ── Share ──────────────────────────────────────────────────
+
+function showShareModal() {
+  const url = buildShareUrl();
+  document.getElementById('share-url-input').value = url;
+  document.getElementById('share-feedback').textContent = '';
+  openModal('modal-share');
+}
+
+function buildShareUrl() {
+  const encoded = encodeState(state);
+  const url = new URL(window.location.href);
+  url.hash = `state=${encoded}`;
+  return url.toString();
+}
+
+function copyShareUrl() {
+  const url = document.getElementById('share-url-input').value;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(() => {
+      document.getElementById('share-feedback').textContent = '✅ Copied to clipboard!';
+    });
+  } else {
+    document.getElementById('share-url-input').select();
+    document.execCommand('copy');
+    document.getElementById('share-feedback').textContent = '✅ Copied!';
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────
+
+function esc(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ── Init ───────────────────────────────────────────────────
+
+function init() {
+  // Load state: URL hash takes priority (shared session), then localStorage
+  const loadedFromHash    = loadFromHash();
+  const loadedFromStorage = !loadedFromHash && loadFromStorage();
+
+  if (!state.courts.length) initDefaultCourts(4);
+
+  populateCategorySelects();
+
+  // Init button states
+  setPairingMode(state.settings.pairingMode);
+  setGameFormat(state.settings.gameFormat);
+
+  // Initial render
+  render();
+  startTimerLoop();
+}
+
+document.addEventListener('DOMContentLoaded', init);
